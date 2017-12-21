@@ -11,6 +11,27 @@ import CLibreSSL
 import Core
 
 extension String {
+    func collapseWhitespace() -> String {
+        let thecomponents = components(separatedBy: CharacterSet.whitespacesAndNewlines).filter { !$0.isEmpty }
+        return thecomponents.joined(separator: " ")
+    }
+    
+    ///  Finds the string between two bookend strings if it can be found.
+    ///
+    ///  - parameter left:  The left bookend
+    ///  - parameter right: The right bookend
+    ///
+    ///  - returns: The string between the two bookends, or nil if the bookends cannot be found, the bookends are the same or appear contiguously.
+    func between(_ left: String, _ right: String) -> String? {
+        guard
+            let leftRange = range(of:left), let rightRange = range(of: right, options: .backwards),
+            left != right && leftRange.upperBound != rightRange.lowerBound
+            else { return nil }
+        
+        return self[leftRange.upperBound...index(before: rightRange.lowerBound)]
+        
+    }
+    
     private func newECKey() throws -> OpaquePointer {
         guard let ecKey = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1) else {
             fatalError()
@@ -92,10 +113,10 @@ extension String {
     /// - returns: Data represented by this hexadecimal string.
     
     func dataFromHexadecimalString() -> Data? {
-        var data = Data(capacity: characters.count / 2)
+        var data = Data(capacity: count / 2)
         
         let regex = try! NSRegularExpression(pattern: "[0-9a-f]{1,2}", options: .caseInsensitive)
-        regex.enumerateMatches(in: self, options: [], range: NSMakeRange(0, characters.count)) { match, flags, stop in
+        regex.enumerateMatches(in: self, options: [], range: NSMakeRange(0, count)) { match, flags, stop in
             let range = self.range(from: match!.range)
             let byteString = self.substring(with: range!)
             var num = UInt8(byteString, radix: 16)
@@ -111,7 +132,7 @@ extension String {
         collectedCharacters.reserveCapacity(length)
         var count = 0
         
-        for character in self.characters {
+        for character in self {
             collectedCharacters.append(character)
             count += 1
             if (count == length) {
