@@ -1,7 +1,4 @@
 import Foundation
-import SwiftString
-import JSON
-import CCurl
 import JSON
 import JWT
 import Console
@@ -10,66 +7,56 @@ open class VaporAPNS {
     fileprivate var options: Options
     private var lastGeneratedToken: (date: Date, token: String)?
     
-    fileprivate var curlHandle: UnsafeMutableRawPointer
+    private lazy var urlSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpShouldUsePipelining = true
+        config.httpAdditionalHeaders = ["User-Agent": "VaporAPNS/1.0.1",
+                                        "Accept": "application/json",
+                                        "Content-Type": "application/json"]
+        let session = URLSession(configuration: config)
+        return session
+    }()
     
     public init(options: Options) throws {
         self.options = options
         
-        if !options.disableCurlCheck {
-            if options.forceCurlInstall {
-                let curlupdater = CurlUpdater()
-                curlupdater.updateCurl()
-            } else {
-                let curlVersionChecker = CurlVersionHelper()
-                curlVersionChecker.checkVersion()
-            }
-        }
-        
-        
-        self.curlHandle = curl_easy_init()
-    
-        curlHelperSetOptBool(curlHandle, CURLOPT_VERBOSE, options.debugLogging ? CURL_TRUE : CURL_FALSE)
-
         if self.options.usesCertificateAuthentication {
-            curlHelperSetOptString(curlHandle, CURLOPT_SSLCERT, options.certPath)
-            curlHelperSetOptString(curlHandle, CURLOPT_SSLCERTTYPE, "PEM")
-            curlHelperSetOptString(curlHandle, CURLOPT_SSLKEY, options.keyPath)
-            curlHelperSetOptString(curlHandle, CURLOPT_SSLKEYTYPE, "PEM")
+            // TODO: Make sure we support that
         }
         
-        curlHelperSetOptInt(curlHandle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0)
     }
     
+    @available(*, unavailable)
     open func send(_ message: ApplePushMessage, to deviceToken: String) -> Result {
+        fatalError("say send(,to:,completionHandler")
+    }
+    
+    open func send(_ message: ApplePushMessage, to deviceToken: String, completionHandler: @escaping (Result) -> Void) {
         // Set URL
-        let url = ("\(self.hostURL(message.sandbox))/3/device/\(deviceToken)")
-        curlHelperSetOptString(curlHandle, CURLOPT_URL, url)
-        
-        // force set port to 443
-        curlHelperSetOptInt(curlHandle, CURLOPT_PORT, options.port.rawValue)
-        
-        // Follow location
-        curlHelperSetOptBool(curlHandle, CURLOPT_FOLLOWLOCATION, CURL_TRUE)
-        
-        // set POST request
-        curlHelperSetOptBool(curlHandle, CURLOPT_POST, CURL_TRUE)
-        
-        // setup payload
-        // TODO: Message payload
-        
-        var postFieldsString = toNullTerminatedUtf8String(try! message.payload.makeJSON().serialize(prettyPrint: false))!
-
-        postFieldsString.withUnsafeMutableBytes() { (t: UnsafeMutablePointer<Int8>) -> Void in
-            curlHelperSetOptString(curlHandle, CURLOPT_POSTFIELDS, t)
+        let urlString = ("\(self.hostURL(message.sandbox))/3/device/\(deviceToken)")
+        guard let url  = URL(string: urlString) else {
+            completionHandler(Result.networkError(error: ServiceStatus.badRequest))
+            return
         }
-        curlHelperSetOptInt(curlHandle, CURLOPT_POSTFIELDSIZE, postFieldsString.count)
-
-        // Tell CURL to add headers
-        curlHelperSetOptBool(curlHandle, CURLOPT_HEADER, CURL_TRUE)
         
-        //Headers
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        
+        // Setup payload
+        do {
+            guard let payloadStringData = toNullTerminatedUtf8String(try message.payload.makeJSON().serialize(prettyPrint: false))
+                else { throw SimpleError.string(message: "Could not convert string") }
+            request.httpBody = payloadStringData
+        } catch {
+            let result = Result.error(apnsId: message.messageId, deviceToken: deviceToken, error: .unknownError(error: "Could not serialize payload"))
+            completionHandler(result)
+            return
+        }
+
+        // Headers
         let headers = self.requestHeaders(for: message)
-        var curlHeaders: UnsafeMutablePointer<curl_slist>?
+        
+        // Add token auth headers
         if !options.usesCertificateAuthentication {
             let token: String
             if let recentToken = lastGeneratedToken, abs(recentToken.date.timeIntervalSinceNow) < 59 * 60 {
@@ -94,7 +81,9 @@ open class VaporAPNS {
                         try jwt2.verifySignature(using: ES256(key: publicKey))
                     } catch {
                         // If we fail here, its an invalid signature
-                        //                    return Result.error(apnsId: message.messageId, deviceToken: deviceToken, error: .invalidSignature)
+                        let result = Result.error(apnsId: message.messageId, deviceToken: deviceToken, error: .invalidSignature)
+                        completionHandler(result)
+                        return
                     }
                     
                 } catch {
@@ -107,79 +96,56 @@ open class VaporAPNS {
                 token = tokenString.replacingOccurrences(of: " ", with: "")
                 lastGeneratedToken = (date: Date(), token: token)
             }
-          
-            curlHeaders = curl_slist_append(curlHeaders, "Authorization: bearer \(token)")
+            
+            request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        curlHeaders = curl_slist_append(curlHeaders, "User-Agent: VaporAPNS/1.0.1")
+        
+        // Global headers are configured as part of the URL session
         for header in headers {
-            curlHeaders = curl_slist_append(curlHeaders, "\(header.key): \(header.value)")
-        }
-        curlHeaders = curl_slist_append(curlHeaders, "Accept: application/json")
-        curlHeaders = curl_slist_append(curlHeaders, "Content-Type: application/json");
-        curlHelperSetOptList(curlHandle, CURLOPT_HTTPHEADER, curlHeaders)
-        
-        // Get response
-        var writeStorage = WriteStorage()
-        curlHelperSetOptWriteFunc(curlHandle, &writeStorage) { (ptr, size, nMemb, privateData) -> Int in
-            let storage = privateData?.assumingMemoryBound(to: WriteStorage.self)
-            let realsize = size * nMemb
-            
-            var bytes: [UInt8] = [UInt8](repeating: 0, count: realsize)
-            memcpy(&bytes, ptr!, realsize)
-            
-            for byte in bytes {
-                storage?.pointee.data.append(byte)
-            }
-            return realsize
+            request.addValue(header.value, forHTTPHeaderField: header.key)
         }
         
-        let ret = curl_easy_perform(curlHandle)
+        let dataTask = self.urlSession.dataTask(with: request) { (data, response, error) in
+            let result: Result
+            defer { completionHandler(result) }
+            
+            if let error = error {
+                result = Result.networkError(error: error)
+            } else if let httpResponse = response as? HTTPURLResponse {
+                let serviceStatus = ServiceStatus(responseStatusCode: httpResponse.statusCode)
                 
-        if ret == CURLE_OK {
-            // Create string from Data
-            let str = String.init(data: writeStorage.data, encoding: .utf8)!
-            
-            // Split into two pieces by '\r\n\r\n' as the response has two newlines before the returned data. This causes us to have two pieces, the headers/crap and the server returned data
-            let splittedString = str.components(separatedBy: "\r\n\r\n")
-            
-            let result: Result!
-            
-            // Ditch the first part and only get the useful data part
-            let responseData = splittedString[1]
-            
-            if responseData != "" {
-                // Get JSON from loaded data string
-                let jsonNode = JSON(.bytes(responseData.makeBytes()), in: nil).makeNode(in: nil)
-                if let reason = jsonNode["reason"]?.string {
-                    result = Result.error(apnsId: message.messageId, deviceToken: deviceToken, error: APNSError.init(errorReason: reason))
+                if let data = data, let string = String(data: data, encoding: .utf8) {
+                    let jsonNode = JSON(.string(string)).makeNode(in: nil)
+                    if let reason = jsonNode["reason"]?.string {
+                        result = Result.error(apnsId: message.messageId,
+                                              deviceToken: deviceToken,
+                                              error: APNSError.init(errorReason: reason))
+                    } else if serviceStatus == .success {
+                        result = Result.success(apnsId: message.messageId,
+                                                deviceToken: deviceToken,
+                                                serviceStatus: .success)
+                    } else {
+                        result = Result.error(apnsId: message.messageId,
+                                              deviceToken: deviceToken,
+                                              error: APNSError.unknownError(error: "ServiceStatus: \(serviceStatus)"))
+                    }
                 } else {
-                    result = Result.success(apnsId: message.messageId, deviceToken: deviceToken, serviceStatus: .success)
+                    result = Result.error(apnsId: message.messageId,
+                                          deviceToken: deviceToken,
+                                          error: APNSError.unknownError(error: "No response data"))
                 }
             } else {
-                result = Result.success(apnsId: message.messageId, deviceToken: deviceToken, serviceStatus: .success)
+                result = Result.networkError(error: SimpleError.string(message: "No HTTP response"))
             }
-            
-            // Do some cleanup
-//            curl_easy_cleanup(curlHandle)
-            curl_slist_free_all(curlHeaders!)
-            
-            return result
-        } else {
-            let error = curl_easy_strerror(ret)
-            let errorString = String(utf8String: error!)!
-            
-//            curl_easy_cleanup(curlHandle)
-            curl_slist_free_all(curlHeaders!)
-            
-            // todo: Better unknown error handling?
-            return Result.networkError(error: SimpleError.string(message: errorString))
         }
+        dataTask.resume()
     }
     
-    open func send(_ message: ApplePushMessage, to deviceTokens: [String], perDeviceResultHandler: ((_ result: Result) -> Void)) {
+    open func send(_ message: ApplePushMessage, to deviceTokens: [String], perDeviceResultHandler: @escaping ((_ result: Result) -> Void)) {
         for deviceToken in deviceTokens {
-            let result = self.send(message, to: deviceToken)
-            perDeviceResultHandler(result)
+            self.send(message, to: deviceToken) { result in
+                perDeviceResultHandler(result)
+            }
         }
     }
     
@@ -207,12 +173,16 @@ open class VaporAPNS {
         }
         
         return headers
-        
     }
     
     fileprivate class WriteStorage {
         var data = Data()
     }
+    
+    // MARK: URLSessionDataDelegate
+    
+    
+
 }
 
 extension VaporAPNS {
